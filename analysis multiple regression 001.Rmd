@@ -1,0 +1,208 @@
+---
+title: "INFO 6105 Final Project — Analysis 1: Multiple Linear Regression"
+author: "Tasmiya Parveen | NUID: 002509350"
+date: "April 2026"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## 1. Introduction
+
+This analysis investigates which flow-level features best predict the average payload size per packet (`flow_pkts_payload.avg`) in IoT network connections using the RT-IoT2022 dataset from the UCI Machine Learning Repository.
+
+**Research Question:** Which flow-level features (forward packet rate, flow duration, and down/up ratio) best predict the average payload size per packet in an IoT network connection?
+
+---
+
+## 2. Load Packages
+
+```{r packages}
+library(ggplot2)
+library(dplyr)
+library(car)
+library(GGally)
+library(reshape2)
+library(broom)
+```
+
+---
+
+## 3. Load and Clean Data
+
+```{r load-data}
+df <- read.csv("data/RT_IOT2022.csv")
+
+cat("Total rows loaded:", nrow(df), "\n")
+cat("Total columns:", ncol(df), "\n")
+```
+
+```{r clean-data}
+df_clean <- df %>%
+  filter(
+    is.finite(flow_pkts_payload.avg) & flow_pkts_payload.avg > 0,
+    is.finite(fwd_pkts_per_sec),
+    is.finite(bwd_pkts_per_sec),
+    is.finite(flow_duration)        & flow_duration > 0,
+    is.finite(down_up_ratio)
+  )
+
+cat("Rows after cleaning:", nrow(df_clean), "\n")
+
+set.seed(42)
+df_sample <- df_clean %>% sample_n(10000)
+
+df_sample <- df_sample %>%
+  mutate(
+    log_payload  = log(flow_pkts_payload.avg),
+    log_duration = log(flow_duration)
+  )
+
+cat("Sample size:", nrow(df_sample), "\n")
+```
+
+---
+
+## 4. Exploratory Visualizations
+
+### 4.1 Scatterplot Matrix
+
+```{r scatterplot-matrix, fig.width=9, fig.height=8}
+plot1_data <- df_sample %>%
+  select(log_payload, fwd_pkts_per_sec,
+         bwd_pkts_per_sec, log_duration, down_up_ratio)
+
+ggpairs(
+  plot1_data,
+  title = "Scatterplot matrix: predictors vs log(payload avg)",
+  upper = list(continuous = wrap("cor", size = 3.5)),
+  lower = list(continuous = wrap("points", alpha = 0.15, size = 0.4)),
+  diag  = list(continuous = wrap("densityDiag", fill = "#7F77DD", alpha = 0.5))
+) +
+  theme_minimal(base_size = 11)
+```
+
+### 4.2 Correlation Heatmap
+
+```{r correlation-heatmap, fig.width=7, fig.height=6}
+cor_matrix <- cor(plot1_data, use = "complete.obs")
+cor_melted  <- melt(cor_matrix)
+
+ggplot(cor_melted, aes(Var1, Var2, fill = value)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = round(value, 2)), size = 3.5) +
+  scale_fill_gradient2(
+    low = "#3B8BD4", mid = "white", high = "#D85A30",
+    midpoint = 0, limits = c(-1, 1), name = "Correlation"
+  ) +
+  labs(
+    title = "Correlation heatmap of regression variables",
+    x = "", y = ""
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 30, hjust = 1))
+```
+
+---
+
+## 5. Initial Model — All 4 Predictors
+
+```{r initial-model}
+model <- lm(log_payload ~ fwd_pkts_per_sec + bwd_pkts_per_sec +
+              log_duration + down_up_ratio,
+            data = df_sample)
+
+summary(model)
+```
+
+### 5.1 VIF Check — Multicollinearity
+
+```{r vif-initial}
+cat("VIF values for initial model:\n")
+vif(model)
+```
+
+**Interpretation:** `fwd_pkts_per_sec` and `bwd_pkts_per_sec` have VIF values exceeding 200,000 — indicating extreme multicollinearity. Both variables are derived from the same underlying packet flow. `bwd_pkts_per_sec` is dropped and the model is refit.
+
+---
+
+## 6. Final Model — After Removing Multicollinear Predictor
+
+```{r final-model}
+model2 <- lm(log_payload ~ fwd_pkts_per_sec + 
+               log_duration + down_up_ratio,
+             data = df_sample)
+
+summary(model2)
+```
+
+### 6.1 VIF Check — Final Model
+
+```{r vif-final}
+cat("VIF values for final model:\n")
+vif(model2)
+```
+
+All VIF values are below 5 — no multicollinearity issues in the final model. ✅
+
+---
+
+## 7. Coefficient Interpretation
+
+```{r coefficients}
+tidy(model2)
+```
+
+**Holding all else constant:**
+
+- **`fwd_pkts_per_sec`** (-5.39e-08, p < 0.001): For each unit increase in forward packet rate, log(payload avg) decreases by 5.39e-08. Statistically significant — high packet rates (typical of flood attacks) are associated with smaller payloads.
+- **`log_duration`** (-2.27e-03, p = 0.083): For each unit increase in log(flow duration), log(payload avg) decreases slightly. Not significant at the 0.05 level — flow duration is a weak predictor of payload size.
+- **`down_up_ratio`** (2.199, p < 0.001): For each unit increase in the down/up ratio, log(payload avg) increases by 2.199. The strongest predictor — connections with more download than upload traffic carry larger payloads.
+
+---
+
+## 8. Model Fit
+
+```{r model-fit}
+r_squared     <- summary(model2)$r.squared
+adj_r_squared <- summary(model2)$adj.r.squared
+f_stat        <- summary(model2)$fstatistic
+
+cat("R-squared:         ", round(r_squared, 4), "\n")
+cat("Adjusted R-squared:", round(adj_r_squared, 4), "\n")
+cat("F-statistic:       ", round(f_stat[1], 2), "\n")
+cat("Overall p-value:   ", pf(f_stat[1], f_stat[2], f_stat[3], lower.tail = FALSE), "\n")
+```
+
+**Interpretation:** The model explains approximately 29% of the variation in log(payload avg) (R² = 0.29). The overall F-test is highly significant (F = 1360.8, p ≈ 0), confirming the model is useful.
+
+---
+
+## 9. Diagnostic Plots
+
+```{r diagnostics, fig.width=9, fig.height=7}
+par(mfrow = c(2, 2))
+plot(model2)
+```
+
+**Interpretation:**
+
+- **Residuals vs Fitted:** Some curvature present — mild non-linearity in the data.
+- **Q-Q Plot:** Tails deviate from the line — slight non-normality in residuals, common with large real-world datasets.
+- **Scale-Location:** Slight fanning pattern — mild heteroscedasticity present, will be noted as a limitation.
+
+---
+
+## 10. Answer to Research Question
+
+The multiple linear regression model reveals that **down/up ratio** is the strongest predictor of average payload size (β = 2.199, p < 0.001), followed by **forward packet rate** (β = -5.39e-08, p < 0.001). Flow duration was not a significant predictor (p = 0.083). The model explains 29% of the variation in payload size (R² = 0.29), which is reasonable for real-world IoT network data with many unmeasured factors.
+
+---
+
+## 11. Session Info
+
+```{r session-info}
+sessionInfo()
+```

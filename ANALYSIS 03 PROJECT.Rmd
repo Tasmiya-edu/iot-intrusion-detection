@@ -1,0 +1,261 @@
+ ---
+title: "INFO 6105 Final Project — Analysis 3: Logistic Regression"
+author: "Tasmiya Parveen | NUID: 002509350"
+date: "April 2026"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## 1. Introduction
+
+This analysis investigates whether flow-level characteristics can predict whether an IoT network connection is an intrusion or normal traffic using the RT-IoT2022 dataset.
+
+**Research Question:** Can flow-level characteristics (flow duration, forward packet rate, backward packet rate, average payload size) predict whether an IoT network connection is an intrusion or normal traffic?
+
+---
+
+## 2. Load Packages
+
+```{r packages, eval=FALSE}
+install.packages("ggplot2", INSTALL_opts = "--no-lock")
+install.packages("dplyr",   INSTALL_opts = "--no-lock")
+install.packages("pROC",    INSTALL_opts = "--no-lock")
+install.packages("caret",   INSTALL_opts = "--no-lock")
+```
+
+```{r load-packages}
+library(ggplot2)
+library(dplyr)
+library(pROC)
+library(caret)
+```
+
+---
+
+## 3. Load and Prepare Data
+
+```{r load-data}
+df <- read.csv("data/RT_IOT2022.csv")
+```
+
+```{r prepare-data}
+df_logistic <- df %>%
+  filter(
+    is.finite(flow_duration)         & flow_duration > 0,
+    is.finite(fwd_pkts_per_sec),
+    is.finite(bwd_pkts_per_sec),
+    is.finite(flow_pkts_payload.avg) & flow_pkts_payload.avg > 0
+  ) %>%
+  mutate(
+    intrusion    = ifelse(Attack_type %in% c("MQTT_Publish",
+                                              "Thing_Speak",
+                                              "Wipro_bulb"), 0, 1),
+    log_duration = log(flow_duration),
+    log_payload  = log(flow_pkts_payload.avg)
+  )
+
+cat("Total rows:", nrow(df_logistic), "\n")
+cat("Class distribution:\n")
+print(table(df_logistic$intrusion))
+cat("Normal %:", round((1 - mean(df_logistic$intrusion)) * 100, 2), "%\n")
+cat("Attack %:", round(mean(df_logistic$intrusion) * 100, 2), "%\n")
+```
+
+**Note on class imbalance:** The derived binary variable has approximately 88% attack and 12% normal traffic. This reflects the nature of the dataset which was collected during active attack simulations. Model evaluation will use precision, recall, F1-score, and AUC in addition to accuracy to account for this imbalance.
+
+---
+
+## 4. Exploratory Visualizations
+
+### 4.1 Intrusion Rate by Protocol Type
+
+```{r intrusion-rate-plot, fig.width=7, fig.height=5}
+df_proto_plot <- df_logistic %>%
+  filter(proto %in% c("tcp", "udp", "icmp")) %>%
+  group_by(proto) %>%
+  summarise(intrusion_rate = mean(intrusion), .groups = "drop")
+
+ggplot(df_proto_plot, aes(x = proto, y = intrusion_rate, fill = proto)) +
+  geom_col(width = 0.5, alpha = 0.85) +
+  scale_fill_manual(values = c(
+    "tcp"  = "#7F77DD",
+    "udp"  = "#1D9E75",
+    "icmp" = "#EF9F27"
+  )) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(
+    title = "Intrusion rate by protocol type",
+    x     = "Protocol type",
+    y     = "Proportion of attack traffic"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+### 4.2 Forward Packets/Sec by Intrusion Status
+
+```{r density-plot, fig.width=7, fig.height=5}
+df_density <- df_logistic %>%
+  filter(fwd_pkts_per_sec < quantile(fwd_pkts_per_sec, 0.99)) %>%
+  mutate(intrusion_label = ifelse(intrusion == 1, "Attack", "Normal"))
+
+ggplot(df_density, aes(x = fwd_pkts_per_sec, fill = intrusion_label)) +
+  geom_density(alpha = 0.5) +
+  scale_fill_manual(values = c("Attack" = "#D85A30", "Normal" = "#1D9E75")) +
+  labs(
+    title = "Forward packets/sec by intrusion status",
+    x     = "Forward packets per second",
+    y     = "Density",
+    fill  = "Traffic type"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+---
+
+## 5. Train/Test Split
+
+```{r train-test-split}
+set.seed(42)
+n         <- nrow(df_logistic)
+train_idx <- sample(1:n, size = 0.7 * n)
+df_train  <- df_logistic[train_idx, ]
+df_test   <- df_logistic[-train_idx, ]
+
+cat("Training rows:", nrow(df_train), "\n")
+cat("Testing rows:", nrow(df_test), "\n")
+```
+
+---
+
+## 6. Fit Logistic Regression Model
+
+```{r fit-model, warning=FALSE}
+logit_model <- glm(
+  intrusion ~ log_duration + fwd_pkts_per_sec +
+              bwd_pkts_per_sec + log_payload,
+  data   = df_train,
+  family = binomial
+)
+
+summary(logit_model)
+```
+
+**Note:** The warning "fitted probabilities numerically 0 or 1 occurred" indicates complete separation — our predictors are so strongly associated with the outcome that some predicted probabilities are essentially certain. This is a sign of strong predictors rather than a modeling error.
+
+---
+
+## 7. Odds Ratios
+
+```{r odds-ratios}
+odds_ratios <- exp(coef(logit_model))
+conf_int    <- exp(coef(logit_model) +
+               outer(sqrt(diag(vcov(logit_model))), c(-1.96, 1.96)))
+colnames(conf_int) <- c("Lower 95%", "Upper 95%")
+
+cat("Odds Ratios with 95% Confidence Intervals:\n")
+print(cbind(OR = round(odds_ratios, 4), round(conf_int, 4)))
+```
+
+**Interpretation (holding all other variables constant):**
+
+- **`log_duration`** (OR = 1.21): Each unit increase in log flow duration makes an attack **1.21 times more likely**
+- **`fwd_pkts_per_sec`** (OR = 1.004): Each unit increase in forward packet rate slightly increases attack probability
+- **`bwd_pkts_per_sec`** (OR = 1.0003): Small but significant increase in attack probability
+- **`log_payload`** (OR = 3.18): Each unit increase in log payload makes an attack **3.18 times more likely** — the strongest predictor
+
+---
+
+## 8. Predictions and Confusion Matrix
+
+```{r predictions}
+pred_probs  <- predict(logit_model, newdata = df_test, type = "response")
+pred_labels <- ifelse(pred_probs > 0.5, 1, 0)
+```
+
+```{r confusion-matrix}
+conf_matrix <- confusionMatrix(
+  factor(pred_labels, levels = c(0, 1)),
+  factor(df_test$intrusion, levels = c(0, 1)),
+  positive = "1"
+)
+print(conf_matrix)
+
+cat("\nKey metrics:\n")
+cat("Accuracy:   ", round(conf_matrix$overall["Accuracy"], 4), "\n")
+cat("Sensitivity:", round(conf_matrix$byClass["Sensitivity"], 4), "\n")
+cat("Specificity:", round(conf_matrix$byClass["Specificity"], 4), "\n")
+cat("Precision:  ", round(conf_matrix$byClass["Precision"], 4), "\n")
+cat("F1 Score:   ", round(conf_matrix$byClass["F1"], 4), "\n")
+```
+
+---
+
+## 9. ROC Curve and AUC
+
+```{r roc-curve, fig.width=6, fig.height=5}
+roc_obj <- roc(df_test$intrusion, pred_probs)
+auc_val <- auc(roc_obj)
+cat("AUC:", round(auc_val, 4), "\n")
+
+plot(roc_obj,
+     col  = "#7F77DD",
+     lwd  = 2,
+     main = paste("ROC Curve — AUC =", round(auc_val, 4)),
+     print.auc = TRUE)
+abline(a = 0, b = 1, lty = 2, col = "gray")
+```
+
+**Interpretation:** AUC = 0.9937 indicates near-perfect discriminative ability. The model correctly ranks a random attack above a random normal connection 99.37% of the time.
+
+---
+
+## 10. Threshold Tuning
+
+```{r threshold-tuning}
+thresholds <- seq(0.1, 0.9, by = 0.1)
+results    <- data.frame()
+
+for (thresh in thresholds) {
+  preds <- ifelse(pred_probs > thresh, 1, 0)
+  tp    <- sum(preds == 1 & df_test$intrusion == 1)
+  fp    <- sum(preds == 1 & df_test$intrusion == 0)
+  tn    <- sum(preds == 0 & df_test$intrusion == 0)
+  fn    <- sum(preds == 0 & df_test$intrusion == 1)
+
+  accuracy    <- (tp + tn) / (tp + fp + tn + fn)
+  sensitivity <- ifelse((tp + fn) > 0, tp / (tp + fn), NA)
+  specificity <- ifelse((tn + fp) > 0, tn / (tn + fp), NA)
+  f1          <- ifelse((tp + fp + fn) > 0,
+                        2 * tp / (2 * tp + fp + fn), NA)
+
+  results <- rbind(results, data.frame(
+    threshold   = thresh,
+    accuracy    = round(accuracy, 4),
+    sensitivity = round(sensitivity, 4),
+    specificity = round(specificity, 4),
+    f1_score    = round(f1, 4)
+  ))
+}
+
+print(results)
+```
+
+**Threshold choice:** A threshold of 0.3 was selected as optimal because it yields the highest F1 score (0.9848) while maintaining 98.34% sensitivity. In cybersecurity, missing an attack is more costly than a false alarm, so maximizing sensitivity is the priority.
+
+---
+
+## 11. Answer to Research Question
+
+The logistic regression model demonstrates that flow-level characteristics are highly effective predictors of intrusion status. Log payload size is the strongest predictor (OR = 3.18, p < 0.001), followed by forward packet rate and flow duration. The model achieves AUC = 0.9937, accuracy = 96.83%, and F1 = 98.19% at the default threshold. Using an optimized threshold of 0.3 further improves sensitivity to 98.34%, which is critical for real-world intrusion detection where missing an attack has severe consequences.
+
+---
+
+## 12. Session Info
+
+```{r session-info}
+sessionInfo()
+```

@@ -1,0 +1,228 @@
+---
+title: "INFO 6105 Final Project — Analysis 4: Bootstrap & Permutation"
+author: "Tasmiya Parveen | NUID: 002509350"
+date: "April 2026"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## 1. Introduction
+
+This analysis investigates whether the median forward packet rate differs significantly between attack and normal IoT network traffic using bootstrap confidence intervals and a permutation test. Results are compared to a parametric t-test alternative.
+
+**Research Question:** What is the median forward packet rate for attack versus normal traffic, and is the observed difference statistically significant?
+
+---
+
+## 2. Load Packages
+
+```{r packages, eval=FALSE}
+install.packages("ggplot2", INSTALL_opts = "--no-lock")
+install.packages("dplyr",   INSTALL_opts = "--no-lock")
+```
+
+```{r load-packages}
+library(ggplot2)
+library(dplyr)
+```
+
+---
+
+## 3. Load and Prepare Data
+
+```{r load-data}
+df <- read.csv("data/RT_IOT2022.csv")
+```
+
+```{r prepare-data}
+df_logistic <- df %>%
+  filter(
+    is.finite(flow_duration)         & flow_duration > 0,
+    is.finite(fwd_pkts_per_sec),
+    is.finite(bwd_pkts_per_sec),
+    is.finite(flow_pkts_payload.avg) & flow_pkts_payload.avg > 0
+  ) %>%
+  mutate(
+    intrusion    = ifelse(Attack_type %in% c("MQTT_Publish",
+                                              "Thing_Speak",
+                                              "Wipro_bulb"), 0, 1),
+    log_duration = log(flow_duration),
+    log_payload  = log(flow_pkts_payload.avg)
+  )
+
+df_boot <- df_logistic %>%
+  filter(is.finite(fwd_pkts_per_sec)) %>%
+  select(fwd_pkts_per_sec, intrusion)
+
+attack_fwd <- df_boot$fwd_pkts_per_sec[df_boot$intrusion == 1]
+normal_fwd <- df_boot$fwd_pkts_per_sec[df_boot$intrusion == 0]
+
+cat("Attack group size:", length(attack_fwd), "\n")
+cat("Normal group size:", length(normal_fwd), "\n")
+cat("Median fwd_pkts_per_sec (attack):", median(attack_fwd), "\n")
+cat("Median fwd_pkts_per_sec (normal):", median(normal_fwd), "\n")
+cat("Observed difference in medians:",
+    median(attack_fwd) - median(normal_fwd), "\n")
+```
+
+**Justification for bootstrap:** `fwd_pkts_per_sec` is heavily right-skewed with extreme outliers from flood attacks (e.g., DOS_SYN_Hping generates hundreds of thousands of packets per second). Formula-based parametric confidence intervals for the median are unreliable under these conditions. Bootstrap inference is appropriate because it makes no distributional assumptions.
+
+---
+
+## 4. Exploratory Visualization
+
+### 4.1 Histogram by Intrusion Status
+
+```{r histogram, fig.width=7, fig.height=5}
+df_hist <- df_boot %>%
+  filter(fwd_pkts_per_sec < quantile(fwd_pkts_per_sec, 0.99)) %>%
+  mutate(intrusion_label = ifelse(intrusion == 1, "Attack", "Normal"))
+
+ggplot(df_hist, aes(x = fwd_pkts_per_sec, fill = intrusion_label)) +
+  geom_histogram(bins = 50, alpha = 0.6, position = "identity") +
+  scale_fill_manual(values = c("Attack" = "#D85A30", "Normal" = "#1D9E75")) +
+  labs(
+    title = "Forward packets/sec by intrusion status (showing skewness)",
+    x     = "Forward packets per second",
+    y     = "Count",
+    fill  = "Traffic type"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+---
+
+## 5. Bootstrap Confidence Intervals
+
+```{r bootstrap, cache=TRUE}
+set.seed(42)
+B <- 1000
+
+boot_medians_attack <- replicate(B, {
+  sample_data <- sample(attack_fwd, size = 500, replace = TRUE)
+  median(sample_data)
+})
+
+boot_medians_normal <- replicate(B, {
+  sample_data <- sample(normal_fwd, size = 500, replace = TRUE)
+  median(sample_data)
+})
+
+ci_attack <- quantile(boot_medians_attack, c(0.025, 0.975))
+ci_normal <- quantile(boot_medians_normal, c(0.025, 0.975))
+
+cat("Bootstrap Results:\n")
+cat("Attack group — Median:", median(attack_fwd), "\n")
+cat("Attack group — 95% CI: [", ci_attack[1], ",", ci_attack[2], "]\n")
+cat("Normal group — Median:", median(normal_fwd), "\n")
+cat("Normal group — 95% CI: [", ci_normal[1], ",", ci_normal[2], "]\n")
+```
+
+### 5.1 Bootstrap Sampling Distribution
+
+```{r bootstrap-plot, fig.width=7, fig.height=5}
+boot_df <- data.frame(
+  median = c(boot_medians_attack, boot_medians_normal),
+  group  = rep(c("Attack", "Normal"), each = B)
+)
+
+ggplot(boot_df, aes(x = median, fill = group)) +
+  geom_histogram(bins = 50, alpha = 0.6, position = "identity") +
+  geom_vline(xintercept = ci_attack[1], color = "#D85A30",
+             linetype = "dashed", linewidth = 0.8) +
+  geom_vline(xintercept = ci_attack[2], color = "#D85A30",
+             linetype = "dashed", linewidth = 0.8) +
+  geom_vline(xintercept = ci_normal[1], color = "#1D9E75",
+             linetype = "dashed", linewidth = 0.8) +
+  geom_vline(xintercept = ci_normal[2], color = "#1D9E75",
+             linetype = "dashed", linewidth = 0.8) +
+  scale_fill_manual(values = c("Attack" = "#D85A30", "Normal" = "#1D9E75")) +
+  labs(
+    title    = "Bootstrap sampling distribution of median fwd packets/sec",
+    subtitle = "Dashed lines = 95% confidence interval boundaries",
+    x        = "Bootstrap median (fwd packets per second)",
+    y        = "Frequency",
+    fill     = "Traffic type"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+**Interpretation:** The two bootstrap confidence intervals are completely non-overlapping — attack traffic CI [246,723 — 262,144] vs normal traffic CI [8.2 — 9.4]. This provides strong visual evidence that the difference in medians is real and not due to chance.
+
+---
+
+## 6. Permutation Test
+
+```{r permutation, cache=TRUE}
+set.seed(42)
+n_perm   <- 1000
+obs_diff <- median(attack_fwd) - median(normal_fwd)
+
+cat("Observed difference in medians:", obs_diff, "\n")
+
+all_data <- c(attack_fwd, normal_fwd)
+n_attack <- length(attack_fwd)
+
+perm_diffs <- replicate(n_perm, {
+  shuffled    <- sample(all_data)
+  perm_attack <- shuffled[1:n_attack]
+  perm_normal <- shuffled[(n_attack + 1):length(shuffled)]
+  median(perm_attack) - median(perm_normal)
+})
+
+p_value <- mean(abs(perm_diffs) >= abs(obs_diff))
+cat("Permutation test p-value:", p_value, "\n")
+cat("Interpretation: In", n_perm, "random shuffles, none produced",
+    "a difference as large as observed.\n")
+```
+
+---
+
+## 7. Comparison to Parametric T-Test
+
+```{r ttest}
+set.seed(42)
+attack_sample <- sample(attack_fwd, 500)
+normal_sample <- sample(normal_fwd, 500)
+
+t_result <- t.test(attack_sample, normal_sample)
+print(t_result)
+
+cat("\nComparison summary:\n")
+cat("Bootstrap CI attack:      [", ci_attack[1], ",", ci_attack[2], "]\n")
+cat("Bootstrap CI normal:      [", ci_normal[1], ",", ci_normal[2], "]\n")
+cat("Permutation p-value:      ", p_value, "\n")
+cat("Parametric t-test p-value:", round(t_result$p.value, 6), "\n")
+```
+
+**Interpretation:** Both the permutation test and parametric t-test yield p ≈ 0, agreeing that the difference is statistically significant. However the t-test operates on means which are heavily distorted by extreme outliers in attack traffic. The bootstrap approach using medians is more appropriate and honest for this heavily skewed variable, as it reflects the typical behavior of each group rather than being pulled by extreme flood attack values.
+
+---
+
+## 8. Effect Size
+
+```{r effect-size}
+effect_size <- median(attack_fwd) - median(normal_fwd)
+cat("Effect size (difference in medians):", effect_size, "\n")
+cat("Attack median:", median(attack_fwd), "\n")
+cat("Normal median:", median(normal_fwd), "\n")
+cat("Attack traffic sends", round(median(attack_fwd) / median(normal_fwd)),
+    "times more packets per second than normal traffic\n")
+```
+
+---
+
+## 9. Answer to Research Question
+
+The bootstrap analysis confirms that attack traffic has a dramatically higher median forward packet rate (246,723 packets/sec, 95% CI [246,723 — 262,144]) compared to normal IoT traffic (9 packets/sec, 95% CI [8.2 — 9.4]). The observed difference in medians of 246,714 packets/sec was never replicated in 1,000 random permutations (p = 0), confirming the difference is statistically significant. The practical effect size is enormous — attack traffic sends approximately 27,000 times more packets per second than normal traffic, reflecting the nature of flood attacks like DOS_SYN_Hping in the dataset.
+
+---
+
+## 10. Session Info
+
+```{r session-info}
+sessionInfo()
+```

@@ -1,0 +1,190 @@
+ ---
+title: "INFO 6105 Final Project — Analysis 2: One-Way ANOVA"
+author: "Tasmiya Parveen | NUID: 002509350"
+date: "April 2026"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+## 1. Introduction
+
+This analysis investigates whether average flow duration differs significantly across the three network protocol types (tcp, udp, icmp) in the RT-IoT2022 dataset.
+
+**Research Question:** Does average flow duration differ significantly across the three network protocol types (tcp, udp, icmp)?
+
+---
+
+## 2. Load Packages
+
+```{r packages, eval=FALSE}
+install.packages("ggplot2",    INSTALL_opts = "--no-lock")
+install.packages("dplyr",      INSTALL_opts = "--no-lock")
+install.packages("car",        INSTALL_opts = "--no-lock")
+install.packages("multcomp",   INSTALL_opts = "--no-lock")
+install.packages("effectsize", INSTALL_opts = "--no-lock")
+```
+
+```{r load-packages}
+library(ggplot2)
+library(dplyr)
+library(car)
+library(multcomp)
+library(effectsize)
+```
+
+---
+
+## 3. Load and Prepare Data
+
+```{r load-data}
+df <- read.csv("data/RT_IOT2022.csv")
+```
+
+```{r prepare-data}
+df_anova <- df %>%
+  filter(
+    proto %in% c("tcp", "udp", "icmp"),
+    is.finite(flow_duration),
+    flow_duration > 0
+  ) %>%
+  mutate(
+    log_duration = log(flow_duration),
+    proto        = factor(proto)
+  )
+
+cat("Rows for ANOVA:", nrow(df_anova), "\n")
+cat("Protocol counts:\n")
+print(table(df_anova$proto))
+```
+
+**Note on group imbalance:** The icmp group has only 24 observations compared to tcp (99,425) and udp (7,687). This imbalance likely contributed to assumption violations discussed in Section 6.
+
+---
+
+## 4. Exploratory Visualizations
+
+### 4.1 Boxplot of Log(Flow Duration) by Protocol
+
+```{r boxplot, fig.width=7, fig.height=5}
+ggplot(df_anova, aes(x = proto, y = log_duration, fill = proto)) +
+  geom_boxplot(alpha = 0.7, outlier.size = 0.6) +
+  scale_fill_manual(values = c(
+    "tcp"  = "#7F77DD",
+    "udp"  = "#1D9E75",
+    "icmp" = "#EF9F27"
+  )) +
+  labs(
+    title = "Log(flow duration) by protocol type",
+    x     = "Protocol type",
+    y     = "log(flow duration in microseconds)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+### 4.2 Group Means with Error Bars
+
+```{r means-plot, fig.width=6, fig.height=5}
+summary_stats <- df_anova %>%
+  group_by(proto) %>%
+  summarise(
+    n            = n(),
+    mean_log_dur = mean(log_duration),
+    sd_log_dur   = sd(log_duration),
+    .groups      = "drop"
+  )
+
+print(summary_stats)
+
+ggplot(summary_stats, aes(x = proto, y = mean_log_dur, fill = proto)) +
+  geom_col(width = 0.5, alpha = 0.8) +
+  geom_errorbar(
+    aes(ymin = mean_log_dur - sd_log_dur,
+        ymax = mean_log_dur + sd_log_dur),
+    width = 0.2, linewidth = 0.8
+  ) +
+  scale_fill_manual(values = c(
+    "tcp"  = "#7F77DD",
+    "udp"  = "#1D9E75",
+    "icmp" = "#EF9F27"
+  )) +
+  labs(
+    title = "Mean log(flow duration) by protocol (± 1 SD)",
+    x     = "Protocol type",
+    y     = "Mean log(flow duration)"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(legend.position = "none")
+```
+
+---
+
+## 5. One-Way ANOVA
+
+```{r anova}
+anova_model <- aov(log_duration ~ proto, data = df_anova)
+summary(anova_model)
+```
+
+**Interpretation:** The F-statistic of 9,448 with p < 2e-16 indicates that at least one protocol group has a significantly different mean log flow duration. The result is highly statistically significant.
+
+---
+
+## 6. Assumption Checks
+
+### 6.1 Normality — Shapiro-Wilk Test
+
+```{r shapiro}
+set.seed(42)
+residuals_sample <- sample(residuals(anova_model), 5000)
+shapiro_result   <- shapiro.test(residuals_sample)
+print(shapiro_result)
+```
+
+### 6.2 Equal Variances — Levene's Test
+
+```{r levene}
+levene_result <- leveneTest(log_duration ~ proto, data = df_anova)
+print(levene_result)
+```
+
+**Interpretation of assumption violations:** Both the Shapiro-Wilk test (W = 0.533, p < 0.001) and Levene's test (F = 14.54, p < 0.001) indicate violations of normality and equal variance assumptions. However, given the large sample size (n = 107,136), ANOVA is considered robust to these violations. The extreme imbalance in the icmp group (n = 24) likely contributed to both violations and is noted as a limitation.
+
+---
+
+## 7. Tukey HSD Post-Hoc Test
+
+```{r tukey}
+tukey_result <- TukeyHSD(anova_model)
+print(tukey_result)
+```
+
+**Interpretation:** All three pairwise comparisons are statistically significant. The order of mean log flow duration from longest to shortest is icmp > udp > tcp. This makes practical sense — ICMP is used for diagnostic pings that can remain active longer, while TCP connections in attack traffic tend to be very short bursts.
+
+---
+
+## 8. Effect Size — Eta Squared (η²)
+
+```{r effect-size}
+eta_result <- eta_squared(anova_model)
+print(eta_result)
+```
+
+**Interpretation:** η² = 0.15 indicates a large effect size. Protocol type explains 15% of the variation in flow duration, meaning protocol type is not only statistically significant but also practically meaningful.
+
+---
+
+## 9. Answer to Research Question
+
+The one-way ANOVA reveals that average flow duration differs significantly across the three protocol types (F = 9,448, p < 2e-16). Tukey HSD post-hoc tests confirm that all three pairs — tcp vs icmp, udp vs icmp, and udp vs tcp — differ significantly. The effect size is large (η² = 0.15), indicating that protocol type is a practically meaningful predictor of flow duration in IoT network traffic.
+
+---
+
+## 10. Session Info
+
+```{r session-info}
+sessionInfo()
+```
